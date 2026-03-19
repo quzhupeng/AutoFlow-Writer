@@ -8,9 +8,11 @@ import os
 import io
 import streamlit as st
 from docx import Document
-from docx.shared import Pt, Inches
+from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from openai import OpenAI
+
+from config import DEEPSEEK_CONFIG, FULL_EXECUTION_PROMPT, GRANULARITY_RULES, REASONING_LOGIC, SELF_CHECK_RULES, SYSTEM_PROMPT, EXISTING_DOC_TEMPLATE
+from llm_client import DeepSeekClient
 
 # ==================== 页面配置 ====================
 st.set_page_config(
@@ -22,6 +24,118 @@ st.set_page_config(
 
 # ==================== 工具函数 ====================
 
+MAX_UPLOAD_SIZE_MB = 10
+MAX_REFERENCE_CHARS = 12000
+
+# 树状图美化样式
+TREE_STYLES = """
+<style>
+.arch-tree {
+    font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+    background: #ffffff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 20px 25px;
+    color: #333;
+    line-height: 1.9;
+    overflow-x: auto;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+.arch-tree .l1 {
+    font-size: 17px;
+    font-weight: 700;
+    color: #1a73e8;
+    margin: 14px 0 8px 0;
+    padding-bottom: 4px;
+    border-bottom: 2px solid #e8f0fe;
+}
+.arch-tree .l2 {
+    font-size: 15px;
+    font-weight: 600;
+    color: #137333;
+    margin: 10px 0 6px 20px;
+}
+.arch-tree .l3 {
+    font-size: 14px;
+    color: #5f6368;
+    margin: 6px 0 4px 40px;
+}
+.arch-tree .branch {
+    color: #9aa0a6;
+}
+</style>
+"""
+
+
+def format_tree_display(tree_text: str) -> str:
+    """将树状图文本转换为带样式的HTML"""
+    lines = tree_text.strip().split('\n')
+    html_parts = ['<div class="arch-tree">']
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        # 根据内容判断层级
+        if stripped.startswith('L1：') or stripped.startswith('L1:'):
+            html_parts.append(f'<div class="l1">{stripped}</div>')
+        elif stripped.startswith('L2：') or stripped.startswith('L2:'):
+            html_parts.append(f'<div class="l2">{stripped}</div>')
+        elif stripped.startswith('L3：') or stripped.startswith('L3:'):
+            html_parts.append(f'<div class="l3">{stripped}</div>')
+        elif '├──' in stripped or '└──' in stripped:
+            # 保留树状结构符号
+            html_parts.append(f'<div class="branch" style="margin-left:{indent*2}px">{stripped}</div>')
+        else:
+            html_parts.append(f'<div style="margin-left:{indent*2}px">{stripped}</div>')
+
+    html_parts.append('</div>')
+    return '\n'.join(html_parts)
+
+
+def display_message_with_tree(content: str):
+    """智能显示消息内容，自动美化树状图"""
+    # 检测是否包含树状图格式
+    has_tree = 'L1：' in content or 'L1:' in content or '├──' in content or '└──' in content
+
+    if has_tree:
+        # 分离树状图和其他文本
+        lines = content.split('\n')
+        tree_lines = []
+        other_lines = []
+        in_tree = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('L1：') or stripped.startswith('L1:'):
+                in_tree = True
+                tree_lines.append(line)
+            elif in_tree and (stripped.startswith('L2') or stripped.startswith('L3') or
+                              '├──' in stripped or '└──' in stripped or not stripped):
+                tree_lines.append(line)
+            else:
+                if in_tree and stripped and not stripped.startswith(('L2', 'L3', '├', '└', '│')):
+                    in_tree = False
+                if in_tree:
+                    tree_lines.append(line)
+                else:
+                    other_lines.append(line)
+
+        # 显示非树状图文本
+        other_text = '\n'.join(other_lines).strip()
+        if other_text:
+            st.markdown(other_text)
+
+        # 美化显示树状图
+        if tree_lines:
+            tree_text = '\n'.join(tree_lines)
+            st.markdown(format_tree_display(tree_text), unsafe_allow_html=True)
+    else:
+        st.markdown(content)
+
 def extract_file_text(uploaded_file) -> str:
     """从上传的文件中提取文本内容"""
     if uploaded_file is None:
@@ -30,8 +144,11 @@ def extract_file_text(uploaded_file) -> str:
     filename = uploaded_file.name.lower()
 
     try:
+        content = uploaded_file.read()
+        if not content:
+            return ""
+
         if filename.endswith('.txt'):
-            content = uploaded_file.read()
             for encoding in ['utf-8', 'gbk', 'gb2312']:
                 try:
                     return content.decode(encoding)
@@ -40,7 +157,7 @@ def extract_file_text(uploaded_file) -> str:
             return content.decode('utf-8', errors='ignore')
 
         elif filename.endswith('.docx'):
-            doc = Document(io.BytesIO(uploaded_file.read()))
+            doc = Document(io.BytesIO(content))
             text_parts = []
             for para in doc.paragraphs:
                 if para.text.strip():
@@ -50,10 +167,10 @@ def extract_file_text(uploaded_file) -> str:
         elif filename.endswith('.pdf'):
             try:
                 import PyPDF2
-                pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+                pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
                 text_parts = []
                 for page in pdf_reader.pages:
-                    page_text = page.extract_text()
+                    page_text = page.extract_text() or ""
                     if page_text.strip():
                         text_parts.append(page_text)
                 return '\n'.join(text_parts)
@@ -65,6 +182,17 @@ def extract_file_text(uploaded_file) -> str:
 
     except Exception as e:
         return f"[文件解析错误: {str(e)}]"
+
+
+def normalize_reference_doc(text: str, max_chars: int = MAX_REFERENCE_CHARS):
+    """规范化参考文档内容，必要时做截断以控制上下文长度"""
+    normalized = (text or "").strip()
+    if not normalized or len(normalized) <= max_chars:
+        return normalized, False
+
+    truncated = normalized[:max_chars]
+    notice = f"\n\n[参考文档超长，已截断，仅保留前{max_chars}字符，原始长度{len(normalized)}字符]"
+    return truncated + notice, True
 
 
 def tree_to_docx(tree_text: str, department_name: str) -> Document:
@@ -97,84 +225,28 @@ def tree_to_docx(tree_text: str, department_name: str) -> Document:
 
     return doc
 
+# ==================== Session State 初始化 ====================
 
-def get_client(api_key: str, base_url: str):
-    """创建 OpenAI 客户端"""
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
-def generate_architecture(client, model: str, department_name: str, business_areas: str, existing_doc: str = None) -> str:
-    """生成流程架构"""
-
-    granularity_rules = """
-## 核心流程知识与颗粒度规范（严格遵循）
-
-**L1（一级流程 / 价值流 / 业务大类）：** 代表一个完整的端到端业务循环或高阶价值链。
-例如："战略规划到执行 (DSTE)"、"集成产品开发 (IPD)"、"线索到回款 (LTC)"。
-
-**L2（二级流程 / 流程组 / 业务阶段）：** L1 的逻辑切分，代表该端到端链路中的核心阶段或专业领域。
-
-**L3（三级流程 / 业务模块）：** L2 的细分，是相对独立的**业务管理模块**，有明确的输入输出边界。
-
-【颗粒度红线（绝对禁止）】：
-L3 绝对不可以是具体的执行动作、会议、文档撰写或任务步骤！
-❌ 错误：组织研讨会、收集市场数据、编写战略草案、审批绩效合约
-✅ 正确：宏观环境与行业洞察、战略规划评估与调整、组织绩效评价
-"""
-
-    self_check_rules = """
-## 输出前强制自检规则
-1. 只输出树状图，不要任何前言、背景分析、边界定义或总结
-2. L3 不能出现"编写"、"组织"、"开会"、"收集"、"审批"等具体动作词汇
-"""
-
-    doc_section = ""
-    if existing_doc and existing_doc.strip():
-        doc_section = f"\n### 参考文档：\n```\n{existing_doc.strip()}\n```\n"
-
-    prompt = f"""{granularity_rules}
-
-{self_check_rules}
-
----
-
-## 输入信息
-
-**部门/业务模块全称**：{department_name}
-**核心细分业务板块**：{business_areas}
-{doc_section}
-
----
-
-请直接输出树状图格式的流程架构键盘图：
-
-L1：[业务大类名称]
-├── L2：[流程组名称]
-│   ├── L3：[业务模块名称]
-│   ├── L3：[业务模块名称]
-│   └── L3：[业务模块名称]
-├── L2：[流程组名称]
-│   ├── L3：[业务模块名称]
-│   └── L3：[业务模块名称]
-"""
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "你是集团型企业端到端流程架构专家。输出符合APQC标准的L1-L3三级流程架构键盘图。"},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=8192,
-        temperature=0.7,
-        timeout=300
-    )
-
-    return response.choices[0].message.content
+def init_session_state():
+    """初始化会话状态"""
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    if 'architecture_result' not in st.session_state:
+        st.session_state.architecture_result = None
+    if 'department_name' not in st.session_state:
+        st.session_state.department_name = ""
+    if 'business_areas' not in st.session_state:
+        st.session_state.business_areas = ""
+    if 'existing_doc_text' not in st.session_state:
+        st.session_state.existing_doc_text = None
 
 
 # ==================== 主应用 ====================
 
 def main():
+    # 初始化会话状态
+    init_session_state()
+
     st.title("🏗️ 企业流程架构设计智能体")
     st.markdown("**基于 APQC 国际标准的端到端三级流程架构设计**")
     st.markdown("---")
@@ -184,9 +256,18 @@ def main():
         st.header("⚙️ API 配置")
 
         # 优先读取 st.secrets（Streamlit Cloud），其次读取环境变量
-        default_key = st.secrets.get("DEEPSEEK_API_KEY", os.getenv("DEEPSEEK_API_KEY", ""))
-        default_url = st.secrets.get("DEEPSEEK_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
-        default_model = st.secrets.get("DEEPSEEK_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-chat"))
+        def get_secret(key: str, default: str = "") -> str:
+            """安全获取 secrets，兼容本地和云端环境"""
+            try:
+                if hasattr(st, 'secrets') and key in st.secrets:
+                    return st.secrets[key]
+            except Exception:
+                pass
+            return os.getenv(key, default)
+
+        default_key = get_secret("DEEPSEEK_API_KEY", "")
+        default_url = get_secret("DEEPSEEK_BASE_URL", DEEPSEEK_CONFIG["base_url"])
+        default_model = get_secret("DEEPSEEK_MODEL", DEEPSEEK_CONFIG["model"])
 
         api_key = st.text_input(
             "DEEPSEEK_API_KEY",
@@ -202,10 +283,14 @@ def main():
             help="API 地址，一般无需修改"
         )
 
+        model_options = ["deepseek-chat", "deepseek-coder"]
+        if default_model and default_model not in model_options:
+            model_options.insert(0, default_model)
+
         model = st.selectbox(
             "模型选择",
-            options=["deepseek-chat", "deepseek-coder"],
-            index=0 if default_model == "deepseek-chat" else 1
+            options=model_options,
+            index=model_options.index(default_model) if default_model in model_options else 0
         )
 
         st.markdown("---")
@@ -217,13 +302,7 @@ def main():
             else:
                 with st.spinner("测试中..."):
                     try:
-                        client = get_client(api_key, base_url)
-                        resp = client.chat.completions.create(
-                            model=model,
-                            messages=[{"role": "user", "content": "hi"}],
-                            max_tokens=10,
-                            timeout=30
-                        )
+                        _ = DeepSeekClient(api_key=api_key, base_url=base_url, model=model).test_connection()
                         st.success("✓ 连接成功")
                     except Exception as e:
                         st.error(f"✗ 连接失败: {str(e)}")
@@ -267,12 +346,25 @@ def main():
     st.subheader("📄 上传现有流程文档（可选）")
     uploaded_file = st.file_uploader("上传参考文档", type=['txt', 'docx', 'pdf'])
 
-    existing_doc_text = ""
+    existing_doc_text = None
     if uploaded_file:
-        with st.spinner("解析中..."):
-            existing_doc_text = extract_file_text(uploaded_file)
-        if existing_doc_text and not existing_doc_text.startswith("["):
-            st.success(f"✓ 已解析: {uploaded_file.name}")
+        file_size = getattr(uploaded_file, "size", 0)
+        if file_size and file_size > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+            st.error(f"文件过大：{file_size / (1024 * 1024):.1f}MB，最大支持 {MAX_UPLOAD_SIZE_MB}MB")
+        else:
+            with st.spinner("解析中..."):
+                parsed_text = extract_file_text(uploaded_file)
+
+            if parsed_text.startswith("["):
+                st.warning(parsed_text)
+            else:
+                existing_doc_text, is_truncated = normalize_reference_doc(parsed_text)
+                if existing_doc_text:
+                    st.success(f"✓ 已解析: {uploaded_file.name}")
+                    if is_truncated:
+                        st.info(f"参考文档内容较长，已自动截断到前 {MAX_REFERENCE_CHARS} 字符。")
+                else:
+                    st.warning("文件已上传，但未提取到有效文本。")
 
     st.markdown("---")
 
@@ -283,71 +375,143 @@ def main():
             "🚀 开始设计",
             type="primary",
             use_container_width=True,
-            disabled=not (api_key and department_name and business_areas)
+            disabled=not (api_key and department_name.strip() and business_areas.strip())
         )
 
-    # 执行与结果
-    if start_button or ('result' in st.session_state and st.session_state.result):
-        if start_button:
-            if 'result' in st.session_state:
-                del st.session_state.result
+    # ==================== 生成初始架构 ====================
+    if start_button:
+        # 重置会话状态
+        st.session_state.messages = []
+        st.session_state.architecture_result = None
+        st.session_state.department_name = department_name
+        st.session_state.business_areas = business_areas
+        st.session_state.existing_doc_text = existing_doc_text
 
-            st.header("⏳ 正在生成架构...")
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-            try:
-                status_text.text("正在连接 API...")
-                progress_bar.progress(10)
+        try:
+            status_text.text("正在连接 API...")
+            progress_bar.progress(10)
 
-                client = get_client(api_key, base_url)
+            client = DeepSeekClient(api_key=api_key, base_url=base_url, model=model)
 
-                status_text.text("🏗️ 正在构建三级流程架构...")
-                progress_bar.progress(50)
+            status_text.text("🏗️ 正在构建三级流程架构...")
+            progress_bar.progress(50)
 
-                result = generate_architecture(
-                    client, model,
-                    department_name,
-                    business_areas,
-                    existing_doc_text if existing_doc_text and not existing_doc_text.startswith("[") else None
-                )
+            # 构建初始提示词
+            doc_section = ""
+            if existing_doc_text and existing_doc_text.strip():
+                doc_section = EXISTING_DOC_TEMPLATE.format(doc_content=existing_doc_text.strip())
 
-                progress_bar.progress(100)
-                status_text.text("✓ 架构设计完成！")
+            initial_prompt = FULL_EXECUTION_PROMPT.format(
+                department_name=department_name,
+                business_areas=business_areas,
+                existing_process_doc_section=doc_section,
+                granularity_rules=GRANULARITY_RULES,
+                reasoning_logic=REASONING_LOGIC,
+                self_check_rules=SELF_CHECK_RULES
+            )
 
-                st.session_state.result = result
-                st.session_state.department_name = department_name
+            # 初始化对话历史
+            st.session_state.messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": initial_prompt}
+            ]
 
-            except Exception as e:
-                progress_bar.empty()
-                status_text.empty()
-                st.error(f"❌ 执行失败: {str(e)}")
-                return
+            # 调用API
+            result = client.chat(st.session_state.messages)
+            if not result or not result.strip():
+                raise RuntimeError("模型返回为空，请重试。")
 
-        # 显示结果
-        if 'result' in st.session_state:
-            st.markdown("---")
-            st.header(f"📊 {st.session_state.get('department_name', '')}端到端三级流程架构键盘图")
-            st.code(st.session_state.result, language=None)
+            # 保存助手回复到对话历史
+            st.session_state.messages.append({"role": "assistant", "content": result})
+            st.session_state.architecture_result = result
 
-            st.markdown("---")
-            col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 1])
-            with col_dl2:
-                doc = tree_to_docx(
-                    st.session_state.result,
-                    st.session_state.get('department_name', '企业')
-                )
-                doc_bytes = io.BytesIO()
-                doc.save(doc_bytes)
-                doc_bytes.seek(0)
+            progress_bar.progress(100)
+            status_text.text("✓ 架构设计完成！可以继续对话优化")
 
-                st.download_button(
-                    label="📥 下载Word文档",
-                    data=doc_bytes,
-                    file_name=f"{st.session_state.get('department_name', '流程架构')}_架构键盘图.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True
-                )
+        except Exception as e:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"❌ 执行失败: {str(e)}")
+            return
+
+    # ==================== 显示当前架构结果 ====================
+    if st.session_state.architecture_result:
+        st.markdown("---")
+        st.header(f"📊 {st.session_state.department_name}端到端三级流程架构键盘图")
+
+        # 注入CSS样式
+        st.markdown(TREE_STYLES, unsafe_allow_html=True)
+
+        # 美化显示
+        st.markdown(format_tree_display(st.session_state.architecture_result), unsafe_allow_html=True)
+
+        # 原始文本（折叠显示）
+        with st.expander("📄 查看原始文本"):
+            st.code(st.session_state.architecture_result, language=None)
+
+        # 下载按钮
+        st.markdown("---")
+        col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 1])
+        with col_dl2:
+            doc = tree_to_docx(
+                st.session_state.architecture_result,
+                st.session_state.department_name or '企业'
+            )
+            doc_bytes = io.BytesIO()
+            doc.save(doc_bytes)
+            doc_bytes.seek(0)
+
+            st.download_button(
+                label="📥 下载Word文档",
+                data=doc_bytes,
+                file_name=f"{st.session_state.department_name or '流程架构'}_架构键盘图.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+
+    # ==================== 多轮对话区域 ====================
+    if st.session_state.messages:
+        st.markdown("---")
+        st.header("💬 继续对话优化架构")
+
+        # 显示对话历史（跳过system和初始长提示词，只显示后续对话）
+        # messages[0]=system, messages[1]=初始提示词, messages[2]=初始回复
+        # 只显示 messages[3:] 之后的对话
+        chat_messages = st.session_state.messages[3:] if len(st.session_state.messages) > 3 else []
+
+        for msg in chat_messages:
+            with st.chat_message(msg["role"]):
+                display_message_with_tree(msg["content"])
+
+        # 对话输入框
+        if prompt := st.chat_input("输入修改意见，如：'招聘流程L2需要拆分为社会招聘和校园招聘'"):
+            # 添加用户消息
+            st.session_state.messages.append({"role": "user", "content": prompt})
+
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # 调用API获取回复
+            with st.chat_message("assistant"):
+                with st.spinner("思考中..."):
+                    try:
+                        client = DeepSeekClient(api_key=api_key, base_url=base_url, model=model)
+                        response = client.chat(st.session_state.messages)
+                        display_message_with_tree(response)
+
+                        # 保存助手回复
+                        st.session_state.messages.append({"role": "assistant", "content": response})
+
+                        # 更新架构结果（如果回复包含树状图格式）
+                        if "L1：" in response or "L1:" in response:
+                            st.session_state.architecture_result = response
+                            st.rerun()  # 刷新页面更新架构显示
+
+                    except Exception as e:
+                        st.error(f"对话失败: {str(e)}")
 
 
 if __name__ == "__main__":
