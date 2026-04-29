@@ -1,0 +1,9 @@
+name = "autoflow-writer"
+compatibility_date = "2024-12-01"
+pages_build_output_dir = "."
+
+# Environment variables (set via `wrangler pages secret put` or CF dashboard)
+# [vars]
+# AI_API_KEY = ""
+# AI_BASE_URL = "https://api.deepseek.com"
+# AI_MODEL = "deepseek-chat"

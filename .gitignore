@@ -1,25 +1,21 @@
-# Python
+node_modules/
+.dev.vars
+.dev.vars.local
+.wrangler/
+output/
+.playwright-mcp/
+*.png
+gan-harness/
+config_data/
+tests/
+docs/
+.env
 __pycache__/
+*.pyc
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
 venv/
 .venv/
-
-# 环境变量（含API Key）
-.env
-
-# IDE
+.streamlit/
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Streamlit
-.streamlit/secrets.toml

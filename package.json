@@ -1,0 +1,22 @@
+{
+  "name": "autoflow-writer",
+  "version": "1.0.0",
+  "description": "企业流程架构设计智能体 - 部署在 Cloudflare Pages",
+  "private": true,
+  "scripts": {
+    "dev": "npx wrangler pages dev . --port 8789",
+    "deploy": "npx wrangler pages deploy . --project-name autoflow-writer",
+    "preview": "npx wrangler pages dev . --port 8789 --compatibility-date 2024-12-01"
+  },
+  "devDependencies": {
+    "wrangler": "^4.85.0"
+  },
+  "keywords": [
+    "cloudflare-pages",
+    "process-architecture",
+    "apqc",
+    "enterprise",
+    "ai"
+  ],
+  "license": "MIT"
+}
